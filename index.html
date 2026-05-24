@@ -1,0 +1,1938 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Dungeon Delver — A Godot-Paradigm Web Demo</title>
+  <style>
+    *{margin:0;padding:0;box-sizing:border-box}
+    body{
+      background:#060610;
+      display:flex;flex-direction:column;
+      align-items:center;justify-content:center;
+      min-height:100vh;
+      font-family:'Courier New',monospace;
+      color:#aabbcc;
+      user-select:none;
+    }
+    #wrapper{position:relative}
+    canvas{
+      display:block;
+      border:2px solid #223344;
+      box-shadow:0 0 60px #001133,0 0 120px #000822;
+      cursor:crosshair;
+    }
+    #info{
+      margin-top:8px;text-align:center;
+      font-size:11px;color:#445566;line-height:1.7;
+    }
+    #info span{color:#7799aa}
+  </style>
+</head>
+<body>
+<div id="wrapper"><canvas id="game"></canvas></div>
+<div id="info">
+  <span>WASD</span> Move &nbsp;·&nbsp; <span>Mouse/Click</span> Aim &amp; Attack &nbsp;·&nbsp;
+  <span>Shift</span> Dodge &nbsp;·&nbsp; <span>Q</span> Cycle Weapon &nbsp;·&nbsp; <span>E</span> Interact
+  <br>Godot-paradigm architecture: EventBus · SceneTree · AStar2D · CPUParticles2D · State Machines
+</div>
+
+<script>
+'use strict';
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 1  CONSTANTS
+// ════════════════════════════════════════════════════════════════════════════
+const W = 900, H = 600;
+const TS = 32;                      // tile size px
+const DW = 56, DH = 42;            // dungeon grid dimensions (tiles)
+const FLOORS = 5;
+
+const TILE = { EMPTY:0, FLOOR:1, WALL:2, WALL_TOP:3, DOOR:4, DOOR_OPEN:5, STAIRS:6 };
+
+const ST = {                        // game states (mirrors Godot SceneTree scene switching)
+  MENU:'menu', PLAY:'play', PAUSE:'pause',
+  TRANSITION:'transition', GAMEOVER:'gameover', WIN:'win'
+};
+
+const C = {                         // palette
+  BG:'#060610', FLOOR:'#1e1e30', FLOOR2:'#1a1a2a',
+  WALL:'#141420', WALL_F:'#2a2a40', WALL_T:'#363655',
+  DOOR:'#5c3a1e', DOOR_O:'#2a1a0a', STAIRS:'#c8a020',
+  PLAYER:'#00e5ff', PLAYER_D:'#007799',
+  SLIME:'#33bb33', SLIME_D:'#116611',
+  SKEL:'#c8c0b0', SKEL_D:'#807870',
+  GHOST:'#7799cc', GHOST_D:'#334466',
+  BOSS:'#cc1133', BOSS_D:'#550011',
+  SWORD_C:'#b0b8c8', BOW_C:'#8b6014', STAFF_C:'#9933ff',
+  HP_C:'#ff3333', KEY_C:'#ffd700', GOLD_C:'#ffd700',
+  PROJ:'#ffcc22', MAGIC:'#bb33ff',
+  HIT:'#ff6622',
+  UI_BG:'rgba(0,0,0,0.75)', UI_BD:'#334455', UI_TXT:'#aabbcc',
+  HP_BAR:'#cc2222', MP_BAR:'#2244cc', GOLD_UI:'#ffd700',
+};
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 2  UTILITIES
+// ════════════════════════════════════════════════════════════════════════════
+const lerp   = (a,b,t) => a+(b-a)*t;
+const clamp  = (v,lo,hi) => Math.max(lo,Math.min(hi,v));
+const rand   = (a,b) => Math.random()*(b-a)+a;
+const randi  = (a,b) => Math.floor(rand(a,b+1));
+const dist   = (ax,ay,bx,by) => Math.hypot(bx-ax,by-ay);
+const sign   = v => v<0?-1:v>0?1:0;
+const norm   = (x,y) => { const m=Math.hypot(x,y)||1; return [x/m,y/m]; };
+const key2   = (x,y) => `${x},${y}`;
+
+class Vec2 {
+  constructor(x=0,y=0){this.x=x;this.y=y}
+  add(v){return new Vec2(this.x+v.x,this.y+v.y)}
+  sub(v){return new Vec2(this.x-v.x,this.y-v.y)}
+  scale(s){return new Vec2(this.x*s,this.y*s)}
+  len(){return Math.hypot(this.x,this.y)}
+  norm(){const m=this.len()||1;return new Vec2(this.x/m,this.y/m)}
+  clone(){return new Vec2(this.x,this.y)}
+}
+
+// Min-heap priority queue for A*
+class PriorityQueue {
+  constructor(){this._h=[]}
+  push(item,pri){
+    this._h.push({item,pri});
+    this._bubbleUp(this._h.length-1);
+  }
+  pop(){
+    const top=this._h[0];
+    const last=this._h.pop();
+    if(this._h.length){this._h[0]=last;this._siftDown(0)}
+    return top?.item;
+  }
+  get size(){return this._h.length}
+  _bubbleUp(i){
+    while(i>0){
+      const p=(i-1)>>1;
+      if(this._h[p].pri<=this._h[i].pri)break;
+      [this._h[p],this._h[i]]=[this._h[i],this._h[p]];
+      i=p;
+    }
+  }
+  _siftDown(i){
+    const n=this._h.length;
+    while(true){
+      let s=i,l=2*i+1,r=2*i+2;
+      if(l<n&&this._h[l].pri<this._h[s].pri)s=l;
+      if(r<n&&this._h[r].pri<this._h[s].pri)s=r;
+      if(s===i)break;
+      [this._h[s],this._h[i]]=[this._h[i],this._h[s]];
+      i=s;
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 3  EVENT BUS  (mirrors Godot's signal system)
+// ════════════════════════════════════════════════════════════════════════════
+class EventBus {
+  constructor(){this._listeners={}}
+  on(evt,fn){(this._listeners[evt]||(this._listeners[evt]=[])).push(fn)}
+  off(evt,fn){const a=this._listeners[evt];if(a)this._listeners[evt]=a.filter(f=>f!==fn)}
+  emit(evt,...args){(this._listeners[evt]||[]).slice().forEach(f=>f(...args))}
+}
+const BUS = new EventBus();  // autoload singleton
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 4  INPUT MANAGER  (mirrors Godot Input class)
+// ════════════════════════════════════════════════════════════════════════════
+class InputManager {
+  constructor(canvas){
+    this._held=new Set();
+    this._just=new Set();
+    this._justUp=new Set();
+    this.mouse={x:W/2,y:H/2,left:false,right:false};
+    this._canvas=canvas;
+    this._bind();
+  }
+  _bind(){
+    document.addEventListener('keydown',e=>{
+      if(!this._held.has(e.code)){this._just.add(e.code)}
+      this._held.add(e.code);
+      if(['Space','ArrowUp','ArrowDown','ArrowLeft','ArrowRight'].includes(e.code))
+        e.preventDefault();
+    });
+    document.addEventListener('keyup',e=>{
+      this._held.delete(e.code);
+      this._justUp.add(e.code);
+    });
+    this._canvas.addEventListener('mousemove',e=>{
+      const r=this._canvas.getBoundingClientRect();
+      this.mouse.x=e.clientX-r.left;
+      this.mouse.y=e.clientY-r.top;
+    });
+    this._canvas.addEventListener('mousedown',e=>{
+      if(e.button===0)this.mouse.left=true;
+      if(e.button===2){this.mouse.right=true;e.preventDefault()}
+    });
+    this._canvas.addEventListener('mouseup',e=>{
+      if(e.button===0)this.mouse.left=false;
+      if(e.button===2)this.mouse.right=false;
+    });
+    this._canvas.addEventListener('contextmenu',e=>e.preventDefault());
+  }
+  held(code){return this._held.has(code)}
+  just(code){return this._just.has(code)}
+  justUp(code){return this._justUp.has(code)}
+  axis(neg,pos){return (this.held(pos)?1:0)-(this.held(neg)?1:0)}
+  flush(){this._just.clear();this._justUp.clear()}
+  // Godot-style action helpers
+  moveX(){return this.axis('KeyA','KeyD')||this.axis('ArrowLeft','ArrowRight')}
+  moveY(){return this.axis('KeyW','KeyS')||this.axis('ArrowUp','ArrowDown')}
+  dodge(){return this.held('ShiftLeft')||this.held('ShiftRight')}
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 5  AUDIO MANAGER  (Web Audio API — zero asset files needed)
+// ════════════════════════════════════════════════════════════════════════════
+class AudioManager {
+  constructor(){
+    this._ctx=null;
+    this._master=null;
+    this._enabled=false;
+  }
+  _init(){
+    if(this._ctx)return;
+    this._ctx=new(window.AudioContext||window.webkitAudioContext)();
+    this._master=this._ctx.createGain();
+    this._master.gain.value=0.18;
+    this._master.connect(this._ctx.destination);
+    this._enabled=true;
+  }
+  _tone(freq,type,dur,vol=0.6,attack=0.005,release=0.05){
+    if(!this._enabled)return;
+    const ctx=this._ctx;
+    const g=ctx.createGain();
+    g.connect(this._master);
+    g.gain.setValueAtTime(0,ctx.currentTime);
+    g.gain.linearRampToValueAtTime(vol,ctx.currentTime+attack);
+    g.gain.exponentialRampToValueAtTime(0.0001,ctx.currentTime+dur);
+    const o=ctx.createOscillator();
+    o.type=type;o.frequency.value=freq;
+    o.connect(g);o.start();o.stop(ctx.currentTime+dur+release);
+  }
+  _noise(dur,vol=0.3){
+    if(!this._enabled)return;
+    const ctx=this._ctx;
+    const buf=ctx.createBuffer(1,ctx.sampleRate*dur,ctx.sampleRate);
+    const d=buf.getChannelData(0);
+    for(let i=0;i<d.length;i++)d[i]=(Math.random()*2-1);
+    const src=ctx.createBufferSource();src.buffer=buf;
+    const g=ctx.createGain();
+    g.gain.setValueAtTime(vol,ctx.currentTime);
+    g.gain.exponentialRampToValueAtTime(0.0001,ctx.currentTime+dur);
+    const f=ctx.createBiquadFilter();f.type='bandpass';f.frequency.value=800;
+    src.connect(f);f.connect(g);g.connect(this._master);
+    src.start();src.stop(ctx.currentTime+dur);
+  }
+  sword(){this._tone(180,'sawtooth',0.08,0.5);this._tone(220,'square',0.06,0.2,0.01,0.03)}
+  arrow(){this._tone(600,'sawtooth',0.04,0.3);this._noise(0.08,0.15)}
+  magic(){this._tone(440,'sine',0.25,0.4);this._tone(660,'sine',0.2,0.3,0.01,0.1);this._tone(880,'sine',0.15,0.2,0.02,0.08)}
+  hit(){this._noise(0.12,0.4);this._tone(80,'square',0.08,0.3)}
+  die(){this._tone(120,'sawtooth',0.3,0.5);this._tone(80,'square',0.4,0.4,0.01,0.2)}
+  pickup(){this._tone(660,'sine',0.1,0.3);this._tone(880,'sine',0.1,0.3,0.05)}
+  stairs(){this._tone(330,'sine',0.2,0.3);this._tone(440,'sine',0.2,0.3,0.1);this._tone(550,'sine',0.3,0.3,0.2)}
+  door(){this._noise(0.2,0.2);this._tone(100,'square',0.15,0.2)}
+  boss(){this._tone(55,'sawtooth',0.5,0.6);this._tone(110,'square',0.4,0.4,0.05)}
+  enable(){this._init()}
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 6  CAMERA  (mirrors Godot Camera2D with smoothing + ScreenShaker)
+// ════════════════════════════════════════════════════════════════════════════
+class Camera {
+  constructor(){
+    this.x=0;this.y=0;        // world position of screen center
+    this._tx=0;this._ty=0;    // target
+    this._shake=0;
+    this._smoothing=8;
+  }
+  target(wx,wy){this._tx=wx;this._ty=wy}
+  shake(amt=6){this._shake=Math.max(this._shake,amt)}
+  update(dt){
+    this.x=lerp(this.x,this._tx,this._smoothing*dt);
+    this.y=lerp(this.y,this._ty,this._smoothing*dt);
+    this._shake=Math.max(0,this._shake-20*dt);
+  }
+  apply(ctx){
+    ctx.save();
+    const sx=(Math.random()-0.5)*this._shake*2;
+    const sy=(Math.random()-0.5)*this._shake*2;
+    ctx.translate(W/2-this.x+sx, H/2-this.y+sy);
+  }
+  restore(ctx){ctx.restore()}
+  // World <-> Screen conversion
+  worldToScreen(wx,wy){return {x:wx-this.x+W/2, y:wy-this.y+H/2}}
+  screenToWorld(sx,sy){return {x:sx+this.x-W/2, y:sy+this.y-H/2}}
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 7  PARTICLE SYSTEM  (mirrors Godot CPUParticles2D with object pooling)
+// ════════════════════════════════════════════════════════════════════════════
+class Particle {
+  constructor(){this.active=false}
+  spawn(x,y,vx,vy,life,size,color,gravity=0,fade=true){
+    this.x=x;this.y=y;this.vx=vx;this.vy=vy;
+    this.life=life;this.maxLife=life;
+    this.size=size;this.color=color;
+    this.gravity=gravity;this.fade=fade;
+    this.active=true;
+  }
+  update(dt){
+    if(!this.active)return;
+    this.x+=this.vx*dt;this.y+=this.vy*dt;
+    this.vy+=this.gravity*dt;
+    this.life-=dt;
+    if(this.life<=0)this.active=false;
+  }
+  draw(ctx){
+    if(!this.active)return;
+    const t=this.life/this.maxLife;
+    ctx.globalAlpha=this.fade?t:1;
+    ctx.fillStyle=this.color;
+    const s=this.size*t;
+    ctx.fillRect(this.x-s/2,this.y-s/2,s,s);
+  }
+}
+
+class ParticleSystem {
+  constructor(maxCount=600){
+    this._pool=Array.from({length:maxCount},()=>new Particle());
+  }
+  _get(){
+    return this._pool.find(p=>!p.active)||this._pool[0];
+  }
+  emit(x,y,{count=8,speed=60,spread=Math.PI*2,color='#ff4444',
+            life=0.5,size=4,gravity=80,fade=true,dir=0}={}){
+    for(let i=0;i<count;i++){
+      const angle=dir+spread*(Math.random()-0.5);
+      const s=speed*(0.5+Math.random());
+      this._get().spawn(x,y,Math.cos(angle)*s,Math.sin(angle)*s,
+        life*(0.7+Math.random()*0.6),size*(0.5+Math.random()),color,gravity,fade);
+    }
+  }
+  blood(x,y){this.emit(x,y,{count:12,speed:80,color:'#cc1111',life:0.4,size:4,gravity:120})}
+  spark(x,y){this.emit(x,y,{count:8,speed:120,color:'#ffcc22',life:0.3,size:3,gravity:60})}
+  magic(x,y){this.emit(x,y,{count:16,speed:70,color:'#9933ff',life:0.6,size:5,gravity:0,fade:true})}
+  smoke(x,y){this.emit(x,y,{count:6,speed:20,color:'#445566',life:0.8,size:8,gravity:-20,fade:true})}
+  pickup(x,y){this.emit(x,y,{count:10,speed:60,color:'#ffd700',life:0.5,size:5,gravity:-40})}
+  update(dt){this._pool.forEach(p=>p.update(dt))}
+  draw(ctx){
+    ctx.save();
+    this._pool.forEach(p=>p.draw(ctx));
+    ctx.globalAlpha=1;
+    ctx.restore();
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 8  DUNGEON GENERATOR  (Binary Space Partitioning — matches Godot TileMap workflow)
+// ════════════════════════════════════════════════════════════════════════════
+class Room {
+  constructor(x,y,w,h){
+    this.x=x;this.y=y;this.w=w;this.h=h;
+    this.cx=Math.floor(x+w/2);
+    this.cy=Math.floor(y+h/2);
+    this.cleared=false;
+    this.visited=false;
+    this.enemies=[];
+    this.items=[];
+    this.doors=[];       // {x,y,dir} — tile coords of door cells
+    this.connected=[];   // sibling rooms this connects to
+  }
+  contains(tx,ty){return tx>=this.x&&tx<this.x+this.w&&ty>=this.y&&ty<this.y+this.h}
+  // Inner floor region (inset 1 tile from wall)
+  inner(){return {x:this.x+1,y:this.y+1,w:this.w-2,h:this.h-2}}
+  randomFloor(){
+    const inn=this.inner();
+    return {
+      x:randi(inn.x,inn.x+inn.w-1),
+      y:randi(inn.y,inn.y+inn.h-1)
+    };
+  }
+}
+
+class BSPNode {
+  constructor(x,y,w,h){this.x=x;this.y=y;this.w=w;this.h=h;this.left=null;this.right=null;this.room=null}
+  isLeaf(){return !this.left&&!this.right}
+  getRoom(){
+    if(this.isLeaf())return this.room;
+    const l=this.left?.getRoom();const r=this.right?.getRoom();
+    if(!l)return r;if(!r)return l;
+    return Math.random()<0.5?l:r;
+  }
+}
+
+class DungeonGenerator {
+  constructor(){
+    this.grid=[];
+    this.rooms=[];
+    this.startRoom=null;
+    this.endRoom=null;
+  }
+  generate(floor=1){
+    this.grid=Array.from({length:DH},()=>new Uint8Array(DW).fill(TILE.WALL));
+    this.rooms=[];
+    const minSize=5+Math.floor(floor/2);
+    const depth=4+Math.min(floor,3);
+    const root=new BSPNode(1,1,DW-2,DH-2);
+    this._split(root,depth,minSize);
+    this._createRooms(root,minSize);
+    this._carveCorridors(root);
+    this._addWallTops();
+    this._placeDoors();
+    // Sort rooms by distance from top-left for start/end selection
+    this.rooms.sort((a,b)=>dist(a.cx,a.cy,0,0)-dist(b.cx,b.cy,0,0));
+    this.startRoom=this.rooms[0];
+    this.endRoom=this.rooms[this.rooms.length-1];
+    this._carve(this.endRoom.cx,this.endRoom.cy,TILE.STAIRS);
+    return this;
+  }
+  _split(node,depth,minSize){
+    if(depth===0)return;
+    const horiz=node.h>node.w?true:node.w>node.h?false:Math.random()<0.5;
+    if(horiz){
+      const min=minSize+2, max=node.h-minSize-2;
+      if(max<min)return;
+      const split=randi(min,max);
+      node.left=new BSPNode(node.x,node.y,node.w,split);
+      node.right=new BSPNode(node.x,node.y+split,node.w,node.h-split);
+    } else {
+      const min=minSize+2,max=node.w-minSize-2;
+      if(max<min)return;
+      const split=randi(min,max);
+      node.left=new BSPNode(node.x,node.y,split,node.h);
+      node.right=new BSPNode(node.x+split,node.y,node.w-split,node.h);
+    }
+    this._split(node.left,depth-1,minSize);
+    this._split(node.right,depth-1,minSize);
+  }
+  _createRooms(node,minSize){
+    if(node.isLeaf()){
+      const rw=randi(minSize,Math.min(node.w-2,minSize+5));
+      const rh=randi(minSize,Math.min(node.h-2,minSize+5));
+      const rx=node.x+randi(1,node.w-rw-1);
+      const ry=node.y+randi(1,node.h-rh-1);
+      const room=new Room(rx,ry,rw,rh);
+      node.room=room;
+      this.rooms.push(room);
+      // Carve floor
+      for(let y=ry;y<ry+rh;y++)
+        for(let x=rx;x<rx+rw;x++)
+          this.grid[y][x]=(x===rx||x===rx+rw-1||y===ry||y===ry+rh-1)?TILE.WALL:TILE.FLOOR;
+    } else {
+      if(node.left)this._createRooms(node.left,minSize);
+      if(node.right)this._createRooms(node.right,minSize);
+    }
+  }
+  _carveCorridors(node){
+    if(!node.left||!node.right)return;
+    this._carveCorridors(node.left);
+    this._carveCorridors(node.right);
+    const a=node.left.getRoom();
+    const b=node.right.getRoom();
+    if(!a||!b)return;
+    a.connected.push(b);b.connected.push(a);
+    // L-shaped corridor
+    if(Math.random()<0.5){
+      this._hCorridor(a.cx,b.cx,a.cy);
+      this._vCorridor(a.cy,b.cy,b.cx);
+    } else {
+      this._vCorridor(a.cy,b.cy,a.cx);
+      this._hCorridor(a.cx,b.cx,b.cy);
+    }
+  }
+  _hCorridor(x1,x2,y){for(let x=Math.min(x1,x2);x<=Math.max(x1,x2);x++)if(this.grid[y])this.grid[y][x]=TILE.FLOOR}
+  _vCorridor(y1,y2,x){for(let y=Math.min(y1,y2);y<=Math.max(y1,y2);y++)if(this.grid[y])this.grid[y][x]=TILE.FLOOR}
+  _carve(tx,ty,type){if(this.grid[ty])this.grid[ty][tx]=type}
+  _addWallTops(){
+    // Cells that are WALL but have a FLOOR tile directly below → WALL_TOP for visual depth
+    for(let y=0;y<DH-1;y++)
+      for(let x=0;x<DW;x++)
+        if(this.grid[y][x]===TILE.WALL&&this.grid[y+1][x]===TILE.FLOOR)
+          this.grid[y][x]=TILE.WALL_TOP;
+  }
+  _placeDoors(){
+    // Detect narrow (1-tile wide) corridor-to-room transitions and stamp a door tile
+    for(const room of this.rooms){
+      // Check border cells of room for adjacency to corridor
+      for(let x=room.x;x<room.x+room.w;x++){
+        const ty_n=room.y-1,ty_s=room.y+room.h;
+        if(ty_n>=0&&this.grid[ty_n][x]===TILE.FLOOR){
+          this.grid[ty_n][x]=TILE.DOOR;
+          room.doors.push({x,y:ty_n});
+        }
+        if(ty_s<DH&&this.grid[ty_s][x]===TILE.FLOOR){
+          this.grid[ty_s][x]=TILE.DOOR;
+          room.doors.push({x,y:ty_s});
+        }
+      }
+      for(let y=room.y;y<room.y+room.h;y++){
+        const tx_w=room.x-1,tx_e=room.x+room.w;
+        if(tx_w>=0&&this.grid[y][tx_w]===TILE.FLOOR){
+          this.grid[y][tx_w]=TILE.DOOR;
+          room.doors.push({x:tx_w,y});
+        }
+        if(tx_e<DW&&this.grid[y][tx_e]===TILE.FLOOR){
+          this.grid[y][tx_e]=TILE.DOOR;
+          room.doors.push({x:tx_e,y});
+        }
+      }
+    }
+  }
+  // Called when a room is cleared — open its doors
+  openDoors(room){
+    for(const d of room.doors){
+      if(this.grid[d.y][d.x]===TILE.DOOR)this.grid[d.y][d.x]=TILE.DOOR_OPEN;
+    }
+  }
+  isWalkable(tx,ty){
+    if(tx<0||ty<0||tx>=DW||ty>=DH)return false;
+    const t=this.grid[ty][tx];
+    return t===TILE.FLOOR||t===TILE.DOOR_OPEN||t===TILE.STAIRS||t===TILE.DOOR;
+  }
+  // Returns which room (if any) a world position is in
+  roomAt(wx,wy){
+    const tx=Math.floor(wx/TS),ty=Math.floor(wy/TS);
+    return this.rooms.find(r=>r.contains(tx,ty))||null;
+  }
+  // Rendering
+  draw(ctx,camX,camY){
+    const x0=Math.max(0,Math.floor((camX-W/2)/TS)-1);
+    const y0=Math.max(0,Math.floor((camY-H/2)/TS)-1);
+    const x1=Math.min(DW,Math.ceil((camX+W/2)/TS)+1);
+    const y1=Math.min(DH,Math.ceil((camY+H/2)/TS)+1);
+    for(let ty=y0;ty<y1;ty++){
+      for(let tx=x0;tx<x1;tx++){
+        const t=this.grid[ty][tx];
+        const px=tx*TS,py=ty*TS;
+        switch(t){
+          case TILE.FLOOR:
+            ctx.fillStyle=(tx+ty)%2===0?C.FLOOR:C.FLOOR2;
+            ctx.fillRect(px,py,TS,TS);
+            // subtle grout lines
+            ctx.strokeStyle='rgba(0,0,0,0.2)';ctx.lineWidth=0.5;
+            ctx.strokeRect(px+0.5,py+0.5,TS-1,TS-1);
+            break;
+          case TILE.WALL:
+            ctx.fillStyle=C.WALL;
+            ctx.fillRect(px,py,TS,TS);
+            ctx.fillStyle=C.WALL_F;
+            ctx.fillRect(px+2,py+2,TS-4,TS-4);
+            break;
+          case TILE.WALL_TOP:
+            ctx.fillStyle=C.WALL_T;
+            ctx.fillRect(px,py,TS,TS);
+            ctx.fillStyle='rgba(255,255,255,0.03)';
+            ctx.fillRect(px,py,TS,4);
+            break;
+          case TILE.DOOR:
+            ctx.fillStyle=C.DOOR;
+            ctx.fillRect(px,py,TS,TS);
+            ctx.fillStyle='rgba(0,0,0,0.4)';
+            ctx.fillRect(px+6,py+2,TS-12,TS-4);
+            // bars
+            ctx.fillStyle='#3a2010';
+            for(let b=0;b<3;b++)ctx.fillRect(px+8+b*5,py+4,2,TS-8);
+            break;
+          case TILE.DOOR_OPEN:
+            ctx.fillStyle=C.DOOR_O;
+            ctx.fillRect(px,py,TS,TS);
+            ctx.fillStyle='rgba(0,0,0,0.5)';
+            ctx.fillRect(px+2,py+2,TS-4,TS-4);
+            break;
+          case TILE.STAIRS:
+            ctx.fillStyle=C.FLOOR;ctx.fillRect(px,py,TS,TS);
+            ctx.fillStyle=C.STAIRS;
+            // Draw staircase chevrons
+            for(let s=0;s<4;s++){
+              ctx.fillRect(px+4+s*3,py+6+s*3,TS-8-s*6,4);
+            }
+            // Glow
+            const sg=ctx.createRadialGradient(px+TS/2,py+TS/2,2,px+TS/2,py+TS/2,TS/2);
+            sg.addColorStop(0,'rgba(200,160,32,0.3)');sg.addColorStop(1,'transparent');
+            ctx.fillStyle=sg;ctx.fillRect(px,py,TS,TS);
+            break;
+        }
+      }
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 9  A* PATHFINDER  (mirrors Godot AStar2D)
+// ════════════════════════════════════════════════════════════════════════════
+class PathFinder {
+  constructor(dungeon){this._dg=dungeon}
+  find(sx,sy,gx,gy,allowDoors=true){
+    // tile coords
+    const stk=key2(sx,sy),gtk=key2(gx,gy);
+    if(stk===gtk)return [];
+    const open=new PriorityQueue();
+    open.push(stk,0);
+    const from={};
+    const g={[stk]:0};
+    const dirs=[[0,-1],[0,1],[-1,0],[1,0]];
+    let found=false;
+    while(open.size){
+      const cur=open.pop();
+      if(cur===gtk){found=true;break}
+      const [cx,cy]=cur.split(',').map(Number);
+      for(const [dx,dy] of dirs){
+        const nx=cx+dx,ny=cy+dy;
+        if(!this._walkable(nx,ny,allowDoors))continue;
+        const nk=key2(nx,ny);
+        const ng=g[cur]+1;
+        if(ng<(g[nk]??Infinity)){
+          g[nk]=ng;from[nk]=cur;
+          open.push(nk,ng+Math.abs(nx-gx)+Math.abs(ny-gy));
+        }
+      }
+    }
+    if(!found)return [];
+    const path=[];let cur=gtk;
+    while(cur&&cur!==stk){path.push(cur);cur=from[cur]}
+    return path.reverse().map(k=>k.split(',').map(Number));
+  }
+  _walkable(tx,ty,allowDoors){
+    if(!this._dg.isWalkable(tx,ty))return false;
+    const t=this._dg.grid[ty]?.[tx];
+    if(!allowDoors&&t===TILE.DOOR)return false;
+    return true;
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 10  BASE ENTITY  (mirrors Godot KinematicBody2D/CharacterBody2D)
+// ════════════════════════════════════════════════════════════════════════════
+class Entity {
+  constructor(x,y,w,h){
+    this.x=x;this.y=y;        // world px (center)
+    this.w=w;this.h=h;        // hitbox dimensions
+    this.vx=0;this.vy=0;
+    this.hp=1;this.maxHp=1;
+    this.speed=100;
+    this.dead=false;
+    this._flashTimer=0;
+    this._invTimer=0;         // invincibility frames
+  }
+  get left(){return this.x-this.w/2}
+  get right(){return this.x+this.w/2}
+  get top(){return this.y-this.h/2}
+  get bottom(){return this.y+this.h/2}
+  get cx(){return this.x}get cy(){return this.y}
+  // AABB collision check
+  overlaps(other){
+    return this.left<other.right&&this.right>other.left&&
+           this.top<other.bottom&&this.bottom>other.top;
+  }
+  overlapsRect(rx,ry,rw,rh){
+    return this.left<rx+rw&&this.right>rx&&this.top<ry+rh&&this.bottom>ry;
+  }
+  // move_and_slide equivalent — resolves tile collisions
+  moveAndSlide(dg,dt){
+    // Move X
+    this.x+=this.vx*dt;
+    this._resolveAxis(dg,'x');
+    // Move Y
+    this.y+=this.vy*dt;
+    this._resolveAxis(dg,'y');
+  }
+  _resolveAxis(dg,axis){
+    const margin=1;
+    const x0=Math.floor((this.left+margin)/TS);
+    const x1=Math.floor((this.right-margin)/TS);
+    const y0=Math.floor((this.top+margin)/TS);
+    const y1=Math.floor((this.bottom-margin)/TS);
+    for(let ty=y0;ty<=y1;ty++){
+      for(let tx=x0;tx<=x1;tx++){
+        const t=dg.grid[ty]?.[tx];
+        if(t===TILE.WALL||t===TILE.WALL_TOP||t===TILE.DOOR){
+          // push out
+          if(axis==='x'){
+            const tileL=tx*TS,tileR=tileL+TS;
+            if(this.vx>0)this.x=tileL-this.w/2-0.5;
+            else if(this.vx<0)this.x=tileR+this.w/2+0.5;
+            this.vx=0;
+          } else {
+            const tileT=ty*TS,tileB=tileT+TS;
+            if(this.vy>0)this.y=tileT-this.h/2-0.5;
+            else if(this.vy<0)this.y=tileB+this.h/2+0.5;
+            this.vy=0;
+          }
+        }
+      }
+    }
+  }
+  damage(amt,knockX=0,knockY=0){
+    if(this._invTimer>0)return false;
+    this.hp=Math.max(0,this.hp-amt);
+    this.vx+=knockX;this.vy+=knockY;
+    this._flashTimer=0.12;
+    this._invTimer=0.18;
+    if(this.hp<=0)this.dead=true;
+    BUS.emit('entity_damaged',this,amt);
+    return true;
+  }
+  heal(amt){this.hp=Math.min(this.maxHp,this.hp+amt)}
+  update(dt){
+    if(this._flashTimer>0)this._flashTimer-=dt;
+    if(this._invTimer>0)this._invTimer-=dt;
+  }
+  get flashing(){return this._flashTimer>0}
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 11  WEAPONS  (Sword · Bow · Staff)
+// ════════════════════════════════════════════════════════════════════════════
+class Weapon {
+  constructor(name,color,cooldown){
+    this.name=name;this.color=color;
+    this.cooldown=cooldown;this._timer=0;
+    this.damage=10;
+  }
+  ready(){return this._timer<=0}
+  update(dt){if(this._timer>0)this._timer-=dt}
+  // Returns list of new projectiles/effects spawned
+  fire(owner,aimX,aimY,dg,particles,audio){return []}
+  _trigger(){this._timer=this.cooldown}
+}
+
+class Sword extends Weapon {
+  constructor(){super('Sword',C.SWORD_C,0.45);this.damage=28;this._swingTimer=0;this._swingAngle=0}
+  fire(owner,aimX,aimY,dg,particles,audio){
+    if(!this.ready())return [];
+    this._trigger();
+    const angle=Math.atan2(aimY-owner.y,aimX-owner.x);
+    this._swingTimer=0.18;this._swingAngle=angle;
+    const reach=48;
+    const hx=owner.x+Math.cos(angle)*reach;
+    const hy=owner.y+Math.sin(angle)*reach;
+    particles.spark(hx,hy);
+    audio.sword();
+    // Return a "melee hit" descriptor
+    return [{type:'melee',x:hx,y:hy,r:28,damage:this.damage,owner}];
+  }
+  update(dt){super.update(dt);if(this._swingTimer>0)this._swingTimer-=dt}
+  drawHeld(ctx,owner,aimX,aimY){
+    const a=Math.atan2(aimY-owner.y,aimX-owner.x);
+    const sa=this._swingTimer>0?this._swingAngle:a;
+    ctx.save();
+    ctx.translate(owner.x,owner.y);ctx.rotate(sa);
+    // Blade
+    ctx.fillStyle=this.flashing?'#fff':C.SWORD_C;
+    ctx.fillRect(4,-3,32,6);
+    // Guard
+    ctx.fillStyle='#888';ctx.fillRect(2,-6,4,12);
+    // Tip gleam
+    ctx.fillStyle='rgba(255,255,255,0.6)';ctx.fillRect(34,-1,4,2);
+    ctx.restore();
+  }
+}
+
+class Bow extends Weapon {
+  constructor(){super('Bow',C.BOW_C,0.7);this.damage=22}
+  fire(owner,aimX,aimY,dg,particles,audio){
+    if(!this.ready())return [];
+    this._trigger();
+    const angle=Math.atan2(aimY-owner.y,aimX-owner.x);
+    audio.arrow();
+    return [{type:'projectile',x:owner.x,y:owner.y,angle,speed:280,damage:this.damage,
+             color:C.PROJ,size:5,owner,pierce:false}];
+  }
+  drawHeld(ctx,owner,aimX,aimY){
+    const a=Math.atan2(aimY-owner.y,aimX-owner.x);
+    ctx.save();ctx.translate(owner.x,owner.y);ctx.rotate(a);
+    ctx.strokeStyle=C.BOW_C;ctx.lineWidth=2;
+    ctx.beginPath();ctx.arc(0,0,14,-0.8,0.8);ctx.stroke();
+    // String
+    ctx.beginPath();ctx.moveTo(14*Math.cos(-0.8),14*Math.sin(-0.8));
+    const pull=this.ready()?0:-4;
+    ctx.lineTo(pull,0);
+    ctx.lineTo(14*Math.cos(0.8),14*Math.sin(0.8));
+    ctx.strokeStyle='rgba(200,180,150,0.8)';ctx.stroke();
+    ctx.restore();
+  }
+}
+
+class Staff extends Weapon {
+  constructor(){super('Staff',C.STAFF_C,1.4);this.damage=40}
+  fire(owner,aimX,aimY,dg,particles,audio){
+    if(!this.ready())return [];
+    this._trigger();
+    const angle=Math.atan2(aimY-owner.y,aimX-owner.x);
+    audio.magic();
+    particles.magic(owner.x,owner.y);
+    return [{type:'projectile',x:owner.x,y:owner.y,angle,speed:180,damage:this.damage,
+             color:C.MAGIC,size:10,owner,aoe:true,aoeR:56}];
+  }
+  drawHeld(ctx,owner,aimX,aimY){
+    const a=Math.atan2(aimY-owner.y,aimX-owner.x);
+    ctx.save();ctx.translate(owner.x,owner.y);ctx.rotate(a);
+    ctx.fillStyle=C.BOW_C;ctx.fillRect(4,-2,30,4);
+    // Orb
+    ctx.fillStyle=C.STAFF_C;ctx.beginPath();ctx.arc(38,0,7,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='rgba(200,100,255,0.5)';ctx.beginPath();ctx.arc(36,-2,3,0,Math.PI*2);ctx.fill();
+    ctx.restore();
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 12  PROJECTILE
+// ════════════════════════════════════════════════════════════════════════════
+class Projectile {
+  constructor(cfg){
+    Object.assign(this,cfg);
+    this.dead=false;
+    this._dist=0;
+    this.maxDist=cfg.aoe?500:700;
+    this._hitSet=new Set();  // prevent multi-hit on same frame
+  }
+  update(dt,dg){
+    this.x+=Math.cos(this.angle)*this.speed*dt;
+    this.y+=Math.sin(this.angle)*this.speed*dt;
+    this._dist+=this.speed*dt;
+    if(this._dist>this.maxDist)this.dead=true;
+    // Wall collision
+    const tx=Math.floor(this.x/TS),ty=Math.floor(this.y/TS);
+    const t=dg.grid[ty]?.[tx];
+    if(!t||t===TILE.WALL||t===TILE.WALL_TOP)this.dead=true;
+  }
+  hitTest(entity){
+    if(entity===this.owner||this._hitSet.has(entity))return false;
+    const d=dist(this.x,this.y,entity.x,entity.y);
+    return d<this.size+entity.w/2;
+  }
+  hit(entity){this._hitSet.add(entity);if(!this.pierce)this.dead=true}
+  draw(ctx){
+    if(this.dead)return;
+    // Glow
+    const g=ctx.createRadialGradient(this.x,this.y,0,this.x,this.y,this.size*2);
+    g.addColorStop(0,this.color);g.addColorStop(1,'transparent');
+    ctx.fillStyle=g;ctx.beginPath();ctx.arc(this.x,this.y,this.size*2,0,Math.PI*2);ctx.fill();
+    // Core
+    ctx.fillStyle=this.color;ctx.beginPath();ctx.arc(this.x,this.y,this.size,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='rgba(255,255,255,0.6)';ctx.beginPath();ctx.arc(this.x-this.size*0.3,this.y-this.size*0.3,this.size*0.3,0,Math.PI*2);ctx.fill();
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 13  PLAYER  (state machine: idle · move · attack · dodge · hurt · dead)
+// ════════════════════════════════════════════════════════════════════════════
+const PSTATE={IDLE:'idle',MOVE:'move',ATTACK:'attack',DODGE:'dodge',HURT:'hurt',DEAD:'dead'};
+
+class Player extends Entity {
+  constructor(x,y){
+    super(x,y,20,20);
+    this.maxHp=120;this.hp=120;
+    this.speed=160;
+    this.gold=0;
+    this.score=0;
+    this.floor=1;
+    // Weapons — Godot-style as child nodes
+    this.weapons=[new Sword(),new Bow(),new Staff()];
+    this.weaponIdx=0;
+    this._state=PSTATE.IDLE;
+    this._dodgeVx=0;this._dodgeVy=0;
+    this._dodgeTimer=0;this._dodgeCooldown=0;
+    this._DODGE_DUR=0.28;this._DODGE_CD=0.9;
+    this._aimX=0;this._aimY=-1;
+    this._facing=0;   // angle
+    this._animTick=0;
+    this._deathTimer=1.5;
+  }
+  get weapon(){return this.weapons[this.weaponIdx]}
+  update(dt,input,dg,particles,audio){
+    super.update(dt);
+    this.weapon.update(dt);
+    this.weapons.forEach(w=>w.update(dt));
+    switch(this._state){
+      case PSTATE.IDLE:case PSTATE.MOVE: this._stateLocomotion(dt,input,dg,particles,audio); break;
+      case PSTATE.DODGE: this._stateDodge(dt,dg); break;
+      case PSTATE.HURT:  this._stateHurt(dt,dg); break;
+      case PSTATE.DEAD:  this._stateDead(dt,particles); break;
+    }
+    if(this._dodgeCooldown>0)this._dodgeCooldown-=dt;
+    this._animTick+=dt;
+    // Weapon cycle
+    if(input.just('KeyQ')){this.weaponIdx=(this.weaponIdx+1)%this.weapons.length;BUS.emit('weapon_changed',this.weapon)}
+  }
+  _stateLocomotion(dt,input,dg,particles,audio){
+    const mx=input.moveX(),my=input.moveY();
+    const moving=mx!==0||my!==0;
+    // Aim toward mouse (camera-adjusted)
+    this._aimX=input._aimWX??this.x+mx*50;
+    this._aimY=input._aimWY??this.y+my*50;
+    if(mx!==0||my!==0){
+      const [nx,ny]=norm(mx,my);
+      this.vx=nx*this.speed;this.vy=ny*this.speed;
+      this._facing=Math.atan2(ny,nx);
+    } else {
+      this.vx*=0.75;this.vy*=0.75;
+    }
+    this.moveAndSlide(dg,dt);
+    this._state=moving?PSTATE.MOVE:PSTATE.IDLE;
+    // Dodge
+    if(input.dodge()&&(mx!==0||my!==0)&&this._dodgeCooldown<=0){
+      const [nx,ny]=norm(mx,my);
+      this._dodgeVx=nx*300;this._dodgeVy=ny*300;
+      this._dodgeTimer=this._DODGE_DUR;
+      this._dodgeCooldown=this._DODGE_CD;
+      this._invTimer=this._DODGE_DUR;
+      this._state=PSTATE.DODGE;
+      particles.smoke(this.x,this.y);
+    }
+  }
+  _stateDodge(dt,dg){
+    this.vx=this._dodgeVx;this.vy=this._dodgeVy;
+    this.moveAndSlide(dg,dt);
+    this._dodgeTimer-=dt;
+    if(this._dodgeTimer<=0)this._state=PSTATE.IDLE;
+  }
+  _stateHurt(dt,dg){
+    this.vx*=0.7;this.vy*=0.7;
+    this.moveAndSlide(dg,dt);
+    if(this._flashTimer<=0)this._state=PSTATE.IDLE;
+  }
+  _stateDead(dt,particles){
+    this._deathTimer-=dt;
+    this.vx*=0.8;this.vy*=0.8;
+    if(Math.random()<0.3)particles.blood(this.x+(Math.random()-0.5)*20,this.y+(Math.random()-0.5)*20);
+  }
+  damage(amt,kx=0,ky=0){
+    if(this._state===PSTATE.DODGE)return false;
+    const hit=super.damage(amt,kx,ky);
+    if(hit){this._state=this.dead?PSTATE.DEAD:PSTATE.HURT;BUS.emit('player_hurt',this)}
+    return hit;
+  }
+  // Returns attack results (melee hits or projectiles)
+  tryAttack(dg,particles,audio){
+    return this.weapon.fire(this,this._aimX,this._aimY,dg,particles,audio);
+  }
+  draw(ctx){
+    const flash=this.flashing;
+    const dead=this._state===PSTATE.DEAD;
+    const a=this._facing;
+    // Shadow
+    ctx.fillStyle='rgba(0,0,0,0.3)';
+    ctx.beginPath();ctx.ellipse(this.x,this.y+9,8,3,0,0,Math.PI*2);ctx.fill();
+    // Body
+    ctx.save();ctx.translate(this.x,this.y);
+    if(dead){ctx.globalAlpha=Math.max(0,this._deathTimer/1.5)}
+    ctx.fillStyle=flash?'#fff':dead?'#555':C.PLAYER;
+    // Main body — hexagonal-ish character shape
+    ctx.beginPath();
+    ctx.moveTo(0,-11);ctx.lineTo(8,-6);ctx.lineTo(8,6);
+    ctx.lineTo(0,11);ctx.lineTo(-8,6);ctx.lineTo(-8,-6);ctx.closePath();ctx.fill();
+    // Dark center
+    ctx.fillStyle=flash?'rgba(255,255,255,0.5)':C.PLAYER_D;
+    ctx.beginPath();ctx.arc(0,0,4,0,Math.PI*2);ctx.fill();
+    // Direction indicator
+    if(!dead){
+      ctx.fillStyle='rgba(255,255,255,0.9)';
+      ctx.fillRect(4,-1.5,7,3);
+    }
+    ctx.restore();
+    // Health bar (in-world, small)
+    if(this.hp<this.maxHp){
+      const bw=24,bh=3,bx=this.x-bw/2,by=this.y-17;
+      ctx.fillStyle='#330000';ctx.fillRect(bx,by,bw,bh);
+      ctx.fillStyle=C.HP_BAR;ctx.fillRect(bx,by,bw*(this.hp/this.maxHp),bh);
+    }
+    // Draw held weapon
+    if(!dead&&this._state!==PSTATE.DODGE){
+      ctx.save();ctx.globalAlpha=0.9;
+      this.weapon.drawHeld?.(ctx,this,this._aimX,this._aimY);
+      ctx.restore();
+    }
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 14  ENEMIES
+// ════════════════════════════════════════════════════════════════════════════
+const EST={IDLE:'idle',WANDER:'wander',CHASE:'chase',ATTACK:'attack',HURT:'hurt',DEAD:'dead'};
+
+class Enemy extends Entity {
+  constructor(x,y,w,h,hp,speed,dmg,xp,color,darkColor){
+    super(x,y,w,h);
+    this.maxHp=hp;this.hp=hp;this.speed=speed;
+    this.dmg=dmg;this.xp=xp;
+    this.color=color;this.darkColor=darkColor;
+    this._state=EST.IDLE;
+    this._stateTimer=0;
+    this._attackTimer=0;
+    this._attackCooldown=1.2;
+    this._aggroRange=180;
+    this._attackRange=36;
+    this._path=[];
+    this._pathTimer=0;
+    this._deathTimer=0.6;
+    this._wanderVx=0;this._wanderVy=0;
+    this._wanderTimer=0;
+    this._animTick=0;
+    this.alerted=false;
+  }
+  update(dt,player,dg,pf,particles,audio){
+    super.update(dt);
+    if(this.dead){this._deathTimer-=dt;return}
+    this._animTick+=dt;
+    if(this._attackTimer>0)this._attackTimer-=dt;
+    const d=dist(this.x,this.y,player.x,player.y);
+    this._ai(dt,player,dg,pf,particles,audio,d);
+    this.moveAndSlide(dg,dt);
+  }
+  _ai(dt,player,dg,pf,particles,audio,d){} // overridden
+  damage(amt,kx=0,ky=0){
+    const h=super.damage(amt,kx,ky);
+    if(h){this.alerted=true;BUS.emit('enemy_hurt',this,amt)}
+    return h;
+  }
+  _drawBase(ctx,shape='hex'){
+    const flash=this.flashing;
+    const t=this._deathTimer;
+    ctx.save();
+    ctx.translate(this.x,this.y);
+    if(this.dead)ctx.globalAlpha=t/0.6;
+    // Shadow
+    ctx.globalAlpha*=0.5;
+    ctx.fillStyle='rgba(0,0,0,0.4)';
+    ctx.beginPath();ctx.ellipse(0,this.h/2,this.w*0.6,3,0,0,Math.PI*2);ctx.fill();
+    ctx.globalAlpha=this.dead?t/0.6:1;
+    // Body
+    ctx.fillStyle=flash?'#fff':this.color;
+    if(shape==='hex'){
+      const r=this.w/2;
+      ctx.beginPath();
+      ctx.moveTo(0,-r);ctx.lineTo(r,-r*0.5);ctx.lineTo(r,r*0.5);
+      ctx.lineTo(0,r);ctx.lineTo(-r,r*0.5);ctx.lineTo(-r,-r*0.5);ctx.closePath();ctx.fill();
+    } else if(shape==='circle'){
+      ctx.beginPath();ctx.arc(0,0,this.w/2,0,Math.PI*2);ctx.fill();
+    } else if(shape==='ghost'){
+      ctx.beginPath();
+      ctx.arc(0,-2,this.w/2,Math.PI,0);
+      ctx.lineTo(this.w/2,this.h/2);
+      // wavy bottom
+      const segs=4,sw=this.w/segs;
+      for(let s=segs;s>=0;s--){
+        ctx.lineTo(-this.w/2+s*sw,this.h/2+(s%2===0?4:-4));
+      }
+      ctx.closePath();ctx.fill();
+    }
+    ctx.restore();
+  }
+  _drawHpBar(ctx){
+    if(this.hp>=this.maxHp)return;
+    const bw=this.w+8,bh=3;
+    const bx=this.x-bw/2,by=this.y-this.h/2-6;
+    ctx.fillStyle='#330000';ctx.fillRect(bx,by,bw,bh);
+    ctx.fillStyle='#cc2222';ctx.fillRect(bx,by,bw*(this.hp/this.maxHp),bh);
+  }
+}
+
+// — Slime: wanders, charges at player, simple but dangerous
+class Slime extends Enemy {
+  constructor(x,y){super(x,y,22,22,30,70,10,5,C.SLIME,C.SLIME_D)}
+  _ai(dt,player,dg,pf,particles,audio,d){
+    if(d<this._aggroRange||this.alerted){
+      this._state=EST.CHASE;
+      if(d<this._attackRange&&this._attackTimer<=0){
+        this._attackTimer=this._attackCooldown;
+        const [nx,ny]=norm(player.x-this.x,player.y-this.y);
+        player.damage(this.dmg,nx*180,ny*180);
+        audio.hit();BUS.emit('player_damaged');
+      }
+      const [nx,ny]=norm(player.x-this.x,player.y-this.y);
+      this.vx=nx*this.speed*(0.8+Math.sin(this._animTick*8)*0.2);
+      this.vy=ny*this.speed*(0.8+Math.cos(this._animTick*8)*0.2);
+    } else {
+      // Wander
+      this._wanderTimer-=dt;
+      if(this._wanderTimer<=0){
+        const a=Math.random()*Math.PI*2;
+        this._wanderVx=Math.cos(a)*this.speed*0.4;
+        this._wanderVy=Math.sin(a)*this.speed*0.4;
+        this._wanderTimer=rand(0.8,2);
+      }
+      this.vx=this._wanderVx;this.vy=this._wanderVy;
+    }
+  }
+  draw(ctx){
+    this._drawBase(ctx,'circle');
+    if(this.dead)return;
+    this._drawHpBar(ctx);
+    // Eyes
+    ctx.fillStyle='rgba(0,0,0,0.7)';
+    const bob=Math.sin(this._animTick*6)*2;
+    ctx.beginPath();ctx.arc(this.x-4,this.y-2+bob,3,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(this.x+4,this.y-2+bob,3,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='rgba(255,255,255,0.8)';
+    ctx.beginPath();ctx.arc(this.x-3,this.y-3+bob,1.5,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(this.x+5,this.y-3+bob,1.5,0,Math.PI*2);ctx.fill();
+  }
+}
+
+// — Skeleton: pathfinds to player, ranged bone throw
+class Skeleton extends Enemy {
+  constructor(x,y){super(x,y,20,24,55,85,15,12,C.SKEL,C.SKEL_D);this._attackCooldown=1.8;this._aggroRange=220}
+  _ai(dt,player,dg,pf,particles,audio,d){
+    if(d<this._aggroRange||this.alerted){
+      this.alerted=true;
+      // A* pathfind every 0.5s
+      this._pathTimer-=dt;
+      if(this._pathTimer<=0){
+        this._pathTimer=0.5;
+        const stx=Math.floor(this.x/TS),sty=Math.floor(this.y/TS);
+        const gtx=Math.floor(player.x/TS),gty=Math.floor(player.y/TS);
+        this._path=pf.find(stx,sty,gtx,gty);
+      }
+      if(d<80){
+        // Too close — back up
+        const [nx,ny]=norm(this.x-player.x,this.y-player.y);
+        this.vx=nx*this.speed*0.7;this.vy=ny*this.speed*0.7;
+      } else if(this._path.length>0){
+        const next=this._path[0];
+        const tx=next[0]*TS+TS/2,ty=next[1]*TS+TS/2;
+        const dd=dist(this.x,this.y,tx,ty);
+        if(dd<8)this._path.shift();
+        const [nx,ny]=norm(tx-this.x,ty-this.y);
+        this.vx=nx*this.speed;this.vy=ny*this.speed;
+      } else {this.vx*=0.5;this.vy*=0.5}
+      // Ranged attack if clear LoS
+      if(this._attackTimer<=0&&d<180){
+        this._attackTimer=this._attackCooldown;
+        BUS.emit('spawn_projectile',{type:'projectile',x:this.x,y:this.y,
+          angle:Math.atan2(player.y-this.y,player.x-this.x),
+          speed:140,damage:this.dmg,color:'#d0c0a0',size:6,owner:this,pierce:false,isEnemy:true});
+        audio.arrow();
+      }
+    } else {this.vx*=0.5;this.vy*=0.5}
+  }
+  draw(ctx){
+    this._drawBase(ctx,'hex');
+    if(this.dead)return;
+    this._drawHpBar(ctx);
+    // Skull face
+    const flash=this.flashing;
+    ctx.fillStyle=flash?'#fff':'rgba(0,0,0,0.8)';
+    // Eye sockets
+    ctx.beginPath();ctx.arc(this.x-4,this.y-2,3.5,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(this.x+4,this.y-2,3.5,0,Math.PI*2);ctx.fill();
+    // Nose
+    ctx.beginPath();ctx.arc(this.x,this.y+2,1.5,0,Math.PI*2);ctx.fill();
+    // Teeth
+    for(let i=0;i<4;i++){
+      ctx.fillRect(this.x-5+i*3.5,this.y+5,2.5,3);
+    }
+  }
+}
+
+// — Ghost: ignores walls, phases through, drains life
+class Ghost extends Enemy {
+  constructor(x,y){super(x,y,20,26,40,60,18,15,C.GHOST,C.GHOST_D);this._aggroRange=250;this._attackRange=28}
+  _ai(dt,player,dg,pf,particles,audio,d){
+    // Ghosts move directly toward player ignoring walls
+    if(d<this._aggroRange||this.alerted){
+      this.alerted=true;
+      const [nx,ny]=norm(player.x-this.x,player.y-this.y);
+      const phase=0.6+0.4*Math.sin(this._animTick*2);
+      this.vx=nx*this.speed*phase;this.vy=ny*this.speed*phase;
+      // Bypass wall collision for ghost movement
+      this.x+=this.vx*dt;this.y+=this.vy*dt;
+      this.vx=0;this.vy=0;  // skip slide (already moved)
+      if(d<this._attackRange&&this._attackTimer<=0){
+        this._attackTimer=this._attackCooldown;
+        const [kx,ky]=norm(player.x-this.x,player.y-this.y);
+        player.damage(this.dmg,kx*100,ky*100);
+        audio.hit();BUS.emit('player_damaged');
+        BUS.emit('ghost_drain',this);
+      }
+    } else {this.vx*=0.5;this.vy*=0.5}
+  }
+  draw(ctx){
+    const flash=this.flashing;
+    const alpha=0.65+0.2*Math.sin(this._animTick*3);
+    ctx.save();ctx.globalAlpha=this.dead?(this._deathTimer/0.6)*alpha:alpha;
+    this._drawBase(ctx,'ghost');
+    ctx.restore();
+    if(this.dead)return;
+    this._drawHpBar(ctx);
+    // Eyes — glowing
+    const ey=this.y-6+Math.sin(this._animTick*2)*3;
+    ctx.fillStyle=flash?'#fff':'rgba(150,200,255,0.9)';
+    ctx.beginPath();ctx.arc(this.x-5,ey,4,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(this.x+5,ey,4,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='rgba(255,255,255,0.95)';
+    ctx.beginPath();ctx.arc(this.x-4,ey-1,2,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(this.x+6,ey-1,2,0,Math.PI*2);ctx.fill();
+  }
+}
+
+// — Boss: multi-phase with charge, summon, and enrage
+class Boss extends Enemy {
+  constructor(x,y){
+    super(x,y,36,36,350,55,25,100,C.BOSS,C.BOSS_D);
+    this._aggroRange=9999;this._attackCooldown=0.8;
+    this._phase=1;this._chargeTimer=0;this._enraged=false;
+    this._summonTimer=8;this._patternTimer=0;
+    this._pattern='circle';
+  }
+  _ai(dt,player,dg,pf,particles,audio,d){
+    // Phase 2 triggers at 50% HP
+    if(this.hp<this.maxHp*0.5&&this._phase===1){
+      this._phase=2;this._enraged=true;
+      this.speed=90;this._attackCooldown=0.5;
+      BUS.emit('boss_enrage');audio.boss();
+      particles.magic(this.x,this.y);particles.magic(this.x+20,this.y);particles.magic(this.x-20,this.y);
+    }
+    this._patternTimer-=dt;
+    this._summonTimer-=dt;
+    // Summon minions at intervals
+    if(this._summonTimer<=0){
+      this._summonTimer=this._enraged?6:10;
+      BUS.emit('boss_summon',this,2+this._phase);
+    }
+    // Pattern switching
+    if(this._patternTimer<=0){
+      this._patternTimer=rand(3,6);
+      this._pattern=Math.random()<0.5?'circle':'spread';
+    }
+    // Pathfind toward player
+    this._pathTimer-=dt;
+    if(this._pathTimer<=0){
+      this._pathTimer=0.4;
+      const stx=Math.floor(this.x/TS),sty=Math.floor(this.y/TS);
+      const gtx=Math.floor(player.x/TS),gty=Math.floor(player.y/TS);
+      this._path=pf.find(stx,sty,gtx,gty);
+    }
+    if(this._path&&this._path.length>0){
+      const nxt=this._path[0];
+      const tx=nxt[0]*TS+TS/2,ty=nxt[1]*TS+TS/2;
+      if(dist(this.x,this.y,tx,ty)<10)this._path.shift();
+      const [nx,ny]=norm(tx-this.x,ty-this.y);
+      this.vx=nx*this.speed;this.vy=ny*this.speed;
+    }
+    // Attack pattern
+    if(this._attackTimer<=0&&d<300){
+      this._attackTimer=this._attackCooldown;
+      if(this._pattern==='circle'){
+        const shots=this._enraged?8:5;
+        for(let i=0;i<shots;i++){
+          const a=(i/shots)*Math.PI*2;
+          BUS.emit('spawn_projectile',{type:'projectile',x:this.x,y:this.y,
+            angle:a,speed:110,damage:this.dmg*0.6,color:C.BOSS,size:8,owner:this,isEnemy:true});
+        }
+        audio.boss();
+      } else {
+        const baseAngle=Math.atan2(player.y-this.y,player.x-this.x);
+        const spread=this._enraged?5:3;
+        for(let i=-(spread>>1);i<=(spread>>1);i++){
+          BUS.emit('spawn_projectile',{type:'projectile',x:this.x,y:this.y,
+            angle:baseAngle+i*0.2,speed:130,damage:this.dmg,color:C.BOSS,size:7,owner:this,isEnemy:true});
+        }
+      }
+    }
+  }
+  draw(ctx){
+    const flash=this.flashing;
+    const pulse=Math.sin(this._animTick*4)*3;
+    ctx.save();ctx.translate(this.x,this.y);
+    if(this.dead)ctx.globalAlpha=this._deathTimer/0.6;
+    // Aura
+    if(!this.dead){
+      const ag=ctx.createRadialGradient(0,0,10,0,0,30+pulse);
+      ag.addColorStop(0,`rgba(200,20,50,${this._enraged?0.4:0.2})`);ag.addColorStop(1,'transparent');
+      ctx.fillStyle=ag;ctx.beginPath();ctx.arc(0,0,30+pulse,0,Math.PI*2);ctx.fill();
+    }
+    // Body — crown shape
+    ctx.fillStyle=flash?'#fff':this._enraged?'#ff2244':C.BOSS;
+    const r=this.w/2;
+    ctx.beginPath();ctx.moveTo(0,-r-8);ctx.lineTo(r*0.5,-r*0.3);ctx.lineTo(r,r*0.5);
+    ctx.lineTo(r*0.5,r);ctx.lineTo(-r*0.5,r);ctx.lineTo(-r,r*0.5);
+    ctx.lineTo(-r*0.5,-r*0.3);ctx.closePath();ctx.fill();
+    // Crown spikes
+    ctx.fillStyle=flash?'#fff':C.GOLD_C;
+    for(let s=-1;s<=1;s+=1){
+      ctx.beginPath();ctx.moveTo(s*12,-r);ctx.lineTo(s*12-6,-r+8);ctx.lineTo(s*12+6,-r+8);ctx.closePath();ctx.fill();
+    }
+    // Eyes
+    ctx.fillStyle='rgba(0,0,0,0.8)';ctx.beginPath();ctx.arc(-8,-4,5,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(8,-4,5,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle=this._enraged?'#ffaa00':'#ff3333';
+    ctx.beginPath();ctx.arc(-7,-5,3,0,Math.PI*2);ctx.fill();
+    ctx.beginPath();ctx.arc(9,-5,3,0,Math.PI*2);ctx.fill();
+    ctx.restore();
+    if(this.dead)return;
+    // Boss HP bar (large, at top of screen — drawn in HUD)
+    this._drawHpBar(ctx);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 15  ITEMS
+// ════════════════════════════════════════════════════════════════════════════
+class Item {
+  constructor(x,y,type,color,label){
+    this.x=x*TS+TS/2;this.y=y*TS+TS/2;
+    this.type=type;this.color=color;this.label=label;
+    this.collected=false;
+    this._bob=Math.random()*Math.PI*2;
+    this._tick=0;
+  }
+  update(dt){this._tick+=dt}
+  get worldX(){return this.x}get worldY(){return this.y}
+  inRange(player){return dist(this.x,this.y,player.x,player.y)<28}
+  collect(player,particles,audio){
+    this.collected=true;
+    particles.pickup(this.x,this.y);
+    audio.pickup();
+    this._applyEffect(player);
+    BUS.emit('item_collected',this,player);
+  }
+  _applyEffect(player){}
+  draw(ctx){
+    if(this.collected)return;
+    const by=Math.sin(this._tick*2.5+this._bob)*3;
+    // Glow
+    const g=ctx.createRadialGradient(this.x,this.y+by,0,this.x,this.y+by,18);
+    g.addColorStop(0,`${this.color}55`);g.addColorStop(1,'transparent');
+    ctx.fillStyle=g;ctx.fillRect(this.x-18,this.y+by-18,36,36);
+    // Icon
+    ctx.fillStyle=this.color;
+    ctx.beginPath();ctx.arc(this.x,this.y+by,8,0,Math.PI*2);ctx.fill();
+    ctx.fillStyle='rgba(255,255,255,0.6)';
+    ctx.beginPath();ctx.arc(this.x-2,this.y+by-3,3,0,Math.PI*2);ctx.fill();
+    // Label
+    ctx.fillStyle=this.color;ctx.font='bold 9px monospace';ctx.textAlign='center';
+    ctx.fillText(this.label,this.x,this.y+by+20);
+  }
+}
+
+class HealthPotion extends Item {
+  constructor(x,y){super(x,y,'health',C.HP_C,'❤ HP')}
+  _applyEffect(p){p.heal(50);BUS.emit('heal',50)}
+}
+class GoldCoin extends Item {
+  constructor(x,y,amt=10){super(x,y,'gold',C.GOLD_C,'✦ GOLD');this.amt=amt}
+  _applyEffect(p){p.gold+=this.amt;p.score+=this.amt*5;BUS.emit('gold_gained',this.amt)}
+}
+class WeaponChest extends Item {
+  constructor(x,y,idx){super(x,y,'weapon',C.STAFF_C,'⚡ WPN');this.weaponIdx=idx}
+  _applyEffect(p){BUS.emit('announce',`Found ${p.weapons[this.weaponIdx].name}!`)}
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 16  HUD
+// ════════════════════════════════════════════════════════════════════════════
+class HUD {
+  constructor(){
+    this._msg=''; this._msgTimer=0;
+    this._dmgFlash=0;
+    this._bossRef=null;
+    BUS.on('player_damaged',()=>{this._dmgFlash=0.25});
+    BUS.on('announce',(m)=>{this._msg=m;this._msgTimer=2.5});
+    BUS.on('boss_enrage',()=>{this._msg='⚠ THE BOSS ENRAGES!';this._msgTimer=3});
+    BUS.on('weapon_changed',(w)=>{this._msg=`Weapon: ${w.name}`;this._msgTimer=1.2});
+  }
+  setBoss(boss){this._bossRef=boss}
+  update(dt){
+    if(this._msgTimer>0)this._msgTimer-=dt;
+    if(this._dmgFlash>0)this._dmgFlash-=dt;
+  }
+  draw(ctx,player,floor){
+    // Damage vignette
+    if(this._dmgFlash>0){
+      const alpha=this._dmgFlash*2.5;
+      const g=ctx.createRadialGradient(W/2,H/2,H*0.2,W/2,H/2,H*0.8);
+      g.addColorStop(0,'transparent');g.addColorStop(1,`rgba(200,0,0,${alpha})`);
+      ctx.fillStyle=g;ctx.fillRect(0,0,W,H);
+    }
+    // Bottom panel BG
+    ctx.fillStyle='rgba(0,0,0,0.65)';
+    ctx.fillRect(0,H-54,W,54);
+    ctx.strokeStyle=C.UI_BD;ctx.lineWidth=1;
+    ctx.beginPath();ctx.moveTo(0,H-54);ctx.lineTo(W,H-54);ctx.stroke();
+    // HP bar
+    const HPW=160,HPH=16;
+    const hpx=12,hpy=H-38;
+    ctx.fillStyle='#330000';ctx.fillRect(hpx,hpy,HPW,HPH);
+    ctx.fillStyle=C.HP_BAR;
+    ctx.fillRect(hpx,hpy,HPW*(player.hp/player.maxHp),HPH);
+    ctx.strokeStyle=C.UI_BD;ctx.lineWidth=1;ctx.strokeRect(hpx,hpy,HPW,HPH);
+    ctx.fillStyle=C.UI_TXT;ctx.font='bold 11px monospace';ctx.textAlign='left';
+    ctx.fillText(`HP  ${player.hp}/${player.maxHp}`,hpx+4,hpy+12);
+    // Dodge bar
+    const dcoolTotal=player._DODGE_CD;
+    const dcool=player._dodgeCooldown;
+    const DW2=80,DH2=8;
+    const dx=12,dy=H-18;
+    ctx.fillStyle='#001133';ctx.fillRect(dx,dy,DW2,DH2);
+    ctx.fillStyle='#1155cc';ctx.fillRect(dx,dy,DW2*Math.max(0,(dcoolTotal-dcool)/dcoolTotal),DH2);
+    ctx.strokeStyle=C.UI_BD;ctx.strokeRect(dx,dy,DW2,DH2);
+    ctx.fillStyle=C.UI_TXT;ctx.font='9px monospace';ctx.fillText('DASH',dx+DW2+4,dy+8);
+    // Weapon panel
+    ctx.fillStyle=C.UI_TXT;ctx.font='bold 12px monospace';ctx.textAlign='center';
+    const wnames=['⚔ SWORD','🏹 BOW','✨ STAFF'];
+    player.weapons.forEach((w,i)=>{
+      const wx=300+i*100,wy=H-38;
+      const active=i===player.weaponIdx;
+      ctx.fillStyle=active?'rgba(0,150,200,0.3)':'rgba(0,0,0,0.3)';
+      ctx.fillRect(wx-40,wy-2,80,22);
+      if(active){ctx.strokeStyle='#0099cc';ctx.lineWidth=2;ctx.strokeRect(wx-40,wy-2,80,22)}
+      ctx.fillStyle=active?'#00e5ff':'#556677';
+      ctx.font=`${active?'bold ':''} 11px monospace`;ctx.textAlign='center';
+      ctx.fillText(wnames[i],wx,wy+14);
+      // Cooldown overlay
+      if(!w.ready()){
+        const prog=1-w._timer/w.cooldown;
+        ctx.fillStyle='rgba(0,0,0,0.55)';
+        ctx.fillRect(wx-40,wy-2,80*(1-prog),22);
+      }
+    });
+    // Stats
+    ctx.fillStyle=C.GOLD_C;ctx.font='bold 12px monospace';ctx.textAlign='right';
+    ctx.fillText(`✦ ${player.gold}`,W-12,H-36);
+    ctx.fillStyle=C.UI_TXT;ctx.font='11px monospace';
+    ctx.fillText(`Score: ${player.score}`,W-12,H-20);
+    // Floor indicator
+    ctx.fillStyle=C.UI_TXT;ctx.font='bold 13px monospace';ctx.textAlign='left';
+    ctx.fillText(`Floor ${floor}/${FLOORS}`,12,H-58);
+    // Boss HP bar
+    if(this._bossRef&&!this._bossRef.dead){
+      const BW=300,BH=18,bx=(W-BW)/2,by=8;
+      ctx.fillStyle='rgba(0,0,0,0.7)';ctx.fillRect(bx-2,by-2,BW+4,BH+4);
+      ctx.fillStyle='#550011';ctx.fillRect(bx,by,BW,BH);
+      ctx.fillStyle=this._bossRef._enraged?'#ff2244':C.BOSS;
+      ctx.fillRect(bx,by,BW*(this._bossRef.hp/this._bossRef.maxHp),BH);
+      ctx.strokeStyle='#cc1133';ctx.lineWidth=2;ctx.strokeRect(bx,by,BW,BH);
+      ctx.fillStyle='#fff';ctx.font='bold 11px monospace';ctx.textAlign='center';
+      ctx.fillText(`BOSS  ${this._bossRef.hp}/${this._bossRef.maxHp}`,W/2,by+13);
+    }
+    // Announce message
+    if(this._msgTimer>0){
+      const alpha=Math.min(1,this._msgTimer*2);
+      ctx.globalAlpha=alpha;
+      ctx.fillStyle='rgba(0,0,0,0.6)';
+      const mw=ctx.measureText(this._msg).width+24;
+      ctx.fillRect(W/2-mw/2,H/2-80,mw,28);
+      ctx.fillStyle='#fff';ctx.font='bold 14px monospace';ctx.textAlign='center';
+      ctx.fillText(this._msg,W/2,H/2-61);
+      ctx.globalAlpha=1;
+    }
+    // E to interact hint
+    ctx.fillStyle='rgba(255,255,200,0.7)';ctx.font='10px monospace';ctx.textAlign='center';
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 17  MINIMAP
+// ════════════════════════════════════════════════════════════════════════════
+class Minimap {
+  constructor(){this.x=W-108;this.y=60;this.mw=100;this.mh=75;this.scale=0}
+  draw(ctx,dg,player){
+    const sx=this.mw/DW,sy=this.mh/DH;
+    this.scale=Math.min(sx,sy);
+    const offX=this.x,offY=this.y;
+    ctx.save();
+    // BG
+    ctx.fillStyle='rgba(0,0,0,0.75)';
+    ctx.fillRect(offX-2,offY-2,this.mw+4,this.mh+4);
+    ctx.strokeStyle=C.UI_BD;ctx.lineWidth=1;ctx.strokeRect(offX-2,offY-2,this.mw+4,this.mh+4);
+    // Rooms
+    for(const room of dg.rooms){
+      const rx=offX+room.x*sx,ry=offY+room.y*sy;
+      const rw=room.w*sx,rh=room.h*sy;
+      ctx.fillStyle=room.cleared?'#223322':room.visited?'#222233':'#1a1a2a';
+      ctx.fillRect(rx,ry,rw,rh);
+      if(room===dg.endRoom){ctx.fillStyle='rgba(200,160,32,0.5)';ctx.fillRect(rx,ry,rw,rh)}
+    }
+    // Corridors (floor tiles that aren't in rooms)
+    for(let ty=0;ty<DH;ty+=2){
+      for(let tx=0;tx<DW;tx+=2){
+        if(dg.grid[ty][tx]===TILE.FLOOR){
+          const inRoom=dg.rooms.some(r=>r.contains(tx,ty));
+          if(!inRoom){ctx.fillStyle='#1e1e30';ctx.fillRect(offX+tx*sx,offY+ty*sy,sx*2,sy*2)}
+        }
+      }
+    }
+    // Player dot
+    const px=offX+(player.x/TS)*sx,py=offY+(player.y/TS)*sy;
+    ctx.fillStyle=C.PLAYER;ctx.beginPath();ctx.arc(px,py,3,0,Math.PI*2);ctx.fill();
+    // Label
+    ctx.fillStyle='#445566';ctx.font='8px monospace';ctx.textAlign='left';
+    ctx.fillText('MAP',offX,offY-4);
+    ctx.restore();
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 18  MENU SCREENS
+// ════════════════════════════════════════════════════════════════════════════
+class MenuScreen {
+  constructor(){this._tick=0;this._hovered=''}
+  update(dt){this._tick+=dt}
+  _panel(ctx,title,lines,buttons,x=W/2,y=H/2-60){
+    // Background
+    const pw=340,ph=280;
+    ctx.fillStyle='rgba(5,5,20,0.92)';ctx.fillRect(x-pw/2,y-20,pw,ph);
+    ctx.strokeStyle=C.UI_BD;ctx.lineWidth=2;ctx.strokeRect(x-pw/2,y-20,pw,ph);
+    // Decorative corners
+    const c=10;
+    [[-1,-1],[1,-1],[-1,1],[1,1]].forEach(([sx,sy])=>{
+      ctx.strokeStyle='#557799';ctx.lineWidth=2;
+      const cx=x+sx*(pw/2-c-2),cy=y+sy*(ph/2-10-c-2);
+      ctx.beginPath();ctx.moveTo(cx-sx*c,cy);ctx.lineTo(cx,cy);ctx.lineTo(cx,cy-sy*c);ctx.stroke();
+    });
+    // Title
+    const glow=ctx.createLinearGradient(x-80,0,x+80,0);
+    glow.addColorStop(0,'#00aacc');glow.addColorStop(0.5,'#00e5ff');glow.addColorStop(1,'#00aacc');
+    ctx.fillStyle=glow;ctx.font='bold 26px monospace';ctx.textAlign='center';
+    ctx.fillText(title,x,y+14);
+    // Lines
+    ctx.fillStyle=C.UI_TXT;ctx.font='12px monospace';
+    lines.forEach((ln,i)=>ctx.fillText(ln,x,y+44+i*20));
+    // Buttons
+    buttons.forEach((b,i)=>{
+      const by=y+120+i*44;const bw=200,bh=34;
+      const hot=this._hovered===b.id;
+      ctx.fillStyle=hot?'rgba(0,150,200,0.35)':'rgba(0,50,80,0.4)';
+      ctx.fillRect(x-bw/2,by-20,bw,bh);
+      ctx.strokeStyle=hot?'#00e5ff':C.UI_BD;ctx.lineWidth=1;
+      ctx.strokeRect(x-bw/2,by-20,bw,bh);
+      ctx.fillStyle=hot?'#00e5ff':C.UI_TXT;ctx.font='bold 14px monospace';ctx.textAlign='center';
+      ctx.fillText(b.label,x,by);
+      b._bx=x-bw/2;b._by=by-20;b._bw=bw;b._bh=bh;
+    });
+    return buttons;
+  }
+  _checkButtons(buttons,mx,my,click){
+    let h='';
+    for(const b of buttons){
+      if(b._bx&&mx>=b._bx&&mx<b._bx+b._bw&&my>=b._by&&my<b._by+b._bh){
+        h=b.id;if(click)return b.id;
+      }
+    }
+    this._hovered=h;return null;
+  }
+  drawTitle(ctx,mx,my,click){
+    // Starfield BG
+    ctx.fillStyle=C.BG;ctx.fillRect(0,0,W,H);
+    for(let i=0;i<80;i++){
+      const sx=(i*137+this._tick*10)%W;const sy=(i*71+this._tick*5)%H;
+      const alpha=0.3+0.3*Math.sin(this._tick+i);
+      ctx.fillStyle=`rgba(150,200,255,${alpha})`;ctx.fillRect(sx,sy,1,1);
+    }
+    // Title logo
+    ctx.fillStyle='rgba(0,0,0,0.5)';ctx.fillRect(W/2-160,H/2-130,320,60);
+    const lg=ctx.createLinearGradient(W/2-150,0,W/2+150,0);
+    lg.addColorStop(0,'#004466');lg.addColorStop(0.5,'#00e5ff');lg.addColorStop(1,'#004466');
+    ctx.fillStyle=lg;ctx.font='bold 36px monospace';ctx.textAlign='center';
+    ctx.fillText('DUNGEON DELVER',W/2,H/2-93);
+    ctx.fillStyle='#557788';ctx.font='12px monospace';
+    ctx.fillText('A Godot-Paradigm Architecture Demo',W/2,H/2-68);
+    const btns=this._panel(ctx,'',['Procedural BSP Dungeons','A* Enemy Pathfinding','5 Floors · 4 Enemy Types'],
+      [{id:'play',label:'▶  NEW GAME'},{id:'hs',label:'⭐  HIGH SCORES'}],W/2,H/2-50);
+    return this._checkButtons(btns,mx,my,click);
+  }
+  drawPause(ctx,mx,my,click){
+    ctx.fillStyle='rgba(0,0,0,0.6)';ctx.fillRect(0,0,W,H);
+    const btns=this._panel(ctx,'PAUSED',[],
+      [{id:'resume',label:'▶  RESUME'},{id:'quit',label:'✕  QUIT TO MENU'}]);
+    return this._checkButtons(btns,mx,my,click);
+  }
+  drawGameOver(ctx,player,mx,my,click){
+    ctx.fillStyle='rgba(0,0,0,0.75)';ctx.fillRect(0,0,W,H);
+    const btns=this._panel(ctx,'YOU DIED',
+      [`Score: ${player.score}`,`Gold: ${player.gold}`,`Floor reached: ${player.floor}`],
+      [{id:'retry',label:'↩  TRY AGAIN'},{id:'quit',label:'✕  MAIN MENU'}]);
+    return this._checkButtons(btns,mx,my,click);
+  }
+  drawWin(ctx,player,mx,my,click){
+    ctx.fillStyle='rgba(0,20,0,0.75)';ctx.fillRect(0,0,W,H);
+    const btns=this._panel(ctx,'VICTORY!',
+      [`Score: ${player.score}`,`Gold: ${player.gold}`,'You cleared all 5 floors!'],
+      [{id:'retry',label:'▶  PLAY AGAIN'},{id:'quit',label:'✕  MAIN MENU'}]);
+    return this._checkButtons(btns,mx,my,click);
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 19  GAME MANAGER  (Godot-style: manages scene tree, nodes, game loop)
+// ════════════════════════════════════════════════════════════════════════════
+class GameManager {
+  constructor(canvas){
+    this.canvas=canvas;
+    this.ctx=canvas.getContext('2d');
+    canvas.width=W;canvas.height=H;
+    // Core systems (Autoload singletons in Godot)
+    this.input=new InputManager(canvas);
+    this.audio=new AudioManager();
+    this.camera=new Camera();
+    this.particles=new ParticleSystem(800);
+    this.hud=new HUD();
+    this.minimap=new Minimap();
+    this.menu=new MenuScreen();
+    // Game state
+    this._state=ST.MENU;
+    this._floor=1;
+    this._transTimer=0;
+    this._transMsg='';
+    this._lastTime=0;
+    // Active scene nodes
+    this.dg=null;this.pf=null;
+    this.player=null;
+    this.enemies=[];this.items=[];this.projectiles=[];
+    this._clickedThisFrame=false;
+    this._prevMouseLeft=false;
+    // Wire up global events
+    this._wireEvents();
+    // High score
+    this._hs=JSON.parse(localStorage.getItem('dd_hs')||'[]');
+  }
+  _wireEvents(){
+    BUS.on('spawn_projectile',(cfg)=>{
+      this.projectiles.push(new Projectile(cfg));
+    });
+    BUS.on('boss_summon',(boss,count)=>{
+      for(let i=0;i<count;i++){
+        const angle=Math.random()*Math.PI*2,r=60+Math.random()*40;
+        const sx=boss.x+Math.cos(angle)*r,sy=boss.y+Math.sin(angle)*r;
+        this.enemies.push(Math.random()<0.5?new Slime(sx,sy):new Ghost(sx,sy));
+      }
+    });
+    BUS.on('entity_damaged',(ent,amt)=>{
+      this.particles.blood(ent.x,ent.y);
+      this.camera.shake(3+amt*0.1);
+    });
+    BUS.on('ghost_drain',(ghost)=>{ghost.hp=Math.min(ghost.maxHp,ghost.hp+8)});
+  }
+  // ── Scene management ──────────────────────────────────────────────────────
+  _loadFloor(floor){
+    this._floor=floor;
+    this.dg=new DungeonGenerator().generate(floor);
+    this.pf=new PathFinder(this.dg);
+    const sr=this.dg.startRoom;
+    if(!this.player){
+      this.player=new Player(sr.cx*TS+TS/2,sr.cy*TS+TS/2);
+    } else {
+      this.player.x=sr.cx*TS+TS/2;this.player.y=sr.cy*TS+TS/2;
+      this.player.hp=Math.min(this.player.maxHp,this.player.hp+40);
+    }
+    this.player.floor=floor;
+    this.enemies=[];this.items=[];this.projectiles=[];
+    this.camera.x=this.player.x;this.camera.y=this.player.y;
+    this.camera.target(this.player.x,this.player.y);
+    // Populate dungeon
+    this._spawnEnemies(floor);
+    this._spawnItems(floor);
+    this.hud.setBoss(null);
+    BUS.emit('announce',`Floor ${floor} — Descend!`);
+    // Final floor has a boss
+    if(floor===FLOORS){
+      const er=this.dg.endRoom;
+      const boss=new Boss(er.cx*TS+TS/2,er.cy*TS+TS/2);
+      this.enemies.push(boss);
+      this.hud.setBoss(boss);
+      BUS.emit('announce','The Boss Awaits...');
+    }
+  }
+  _spawnEnemies(floor){
+    const nonStart=this.dg.rooms.filter(r=>r!==this.dg.startRoom);
+    for(const room of nonStart){
+      const count=randi(1,2+Math.min(floor,3));
+      for(let i=0;i<count;i++){
+        const pos=room.randomFloor();
+        const wx=pos.x*TS+TS/2,wy=pos.y*TS+TS/2;
+        const r=Math.random();
+        let e;
+        if(floor===1)e=new Slime(wx,wy);
+        else if(floor===2)e=r<0.6?new Slime(wx,wy):new Skeleton(wx,wy);
+        else if(floor===3)e=r<0.3?new Slime(wx,wy):r<0.7?new Skeleton(wx,wy):new Ghost(wx,wy);
+        else e=r<0.25?new Slime(wx,wy):r<0.6?new Skeleton(wx,wy):new Ghost(wx,wy);
+        this.enemies.push(e);
+        room.enemies.push(e);
+      }
+    }
+  }
+  _spawnItems(floor){
+    const rooms=this.dg.rooms;
+    // Health potions
+    const potCount=2+Math.floor(rooms.length/4);
+    for(let i=0;i<potCount;i++){
+      const room=rooms[randi(0,rooms.length-1)];
+      const pos=room.randomFloor();
+      this.items.push(new HealthPotion(pos.x,pos.y));
+    }
+    // Gold coins
+    for(let i=0;i<rooms.length;i++){
+      if(Math.random()<0.6){
+        const room=rooms[i];const pos=room.randomFloor();
+        this.items.push(new GoldCoin(pos.x,pos.y,randi(5,20)*floor));
+      }
+    }
+  }
+  // ── Main loop ─────────────────────────────────────────────────────────────
+  start(){requestAnimationFrame(ts=>this._loop(ts))}
+  _loop(ts){
+    const dt=Math.min((ts-this._lastTime)/1000,0.05);
+    this._lastTime=ts;
+    // Click detection
+    this._clickedThisFrame=this.input.mouse.left&&!this._prevMouseLeft;
+    this._prevMouseLeft=this.input.mouse.left;
+    this._update(dt);
+    this._draw();
+    this.input.flush();
+    requestAnimationFrame(t=>this._loop(t));
+  }
+  _update(dt){
+    switch(this._state){
+      case ST.MENU: this._updateMenu(dt); break;
+      case ST.PLAY: this._updatePlay(dt); break;
+      case ST.PAUSE: this._updatePause(dt); break;
+      case ST.TRANSITION: this._updateTransition(dt); break;
+      case ST.GAMEOVER: break;
+      case ST.WIN: break;
+    }
+  }
+  _updateMenu(dt){this.menu.update(dt)}
+  _updatePause(dt){
+    if(this.input.just('Escape'))this._state=ST.PLAY;
+  }
+  _updateTransition(dt){
+    this._transTimer-=dt;
+    if(this._transTimer<=0){
+      if(this._nextFloor>FLOORS){this._state=ST.WIN;this._saveScore()}
+      else{this._loadFloor(this._nextFloor);this._state=ST.PLAY}
+    }
+  }
+  _updatePlay(dt){
+    if(this.input.just('Escape')){this._state=ST.PAUSE;return}
+    // Update aim (transform screen mouse to world)
+    const wm=this.camera.screenToWorld(this.input.mouse.x,this.input.mouse.y);
+    this.input._aimWX=wm.x;this.input._aimWY=wm.y;
+    // Player update
+    this.player.update(dt,this.input,this.dg,this.particles,this.audio);
+    if(this.player.dead&&this.player._deathTimer<=0){
+      this._state=ST.GAMEOVER;this._saveScore();return;
+    }
+    // Attack input
+    if((this.input.mouse.left||this.input.just('Space'))&&!this.player.dead){
+      this.audio.enable();
+      const effects=this.player.tryAttack(this.dg,this.particles,this.audio);
+      this._processAttackEffects(effects);
+    }
+    // Enemies
+    for(const e of this.enemies){
+      if(!e.dead)e.update(dt,this.player,this.dg,this.pf,this.particles,this.audio);
+    }
+    // Projectiles
+    for(const p of this.projectiles){
+      p.update(dt,this.dg);
+      if(p.dead)continue;
+      if(p.isEnemy){
+        // Enemy proj hits player
+        if(p.hitTest(this.player)){
+          const kangle=p.angle;
+          this.player.damage(p.damage,Math.cos(kangle)*120,Math.sin(kangle)*120);
+          p.hit(this.player);
+          this.particles.spark(p.x,p.y);this.camera.shake(4);
+        }
+      } else {
+        // Player proj hits enemies
+        for(const e of this.enemies){
+          if(e.dead)continue;
+          if(p.hitTest(e)){
+            const kangle=p.angle;
+            const killed=!e.dead;
+            e.damage(p.damage,Math.cos(kangle)*80,Math.sin(kangle)*80);
+            p.hit(e);
+            if(p.aoe){
+              // Area of effect
+              for(const e2 of this.enemies){
+                if(e2!==e&&!e2.dead&&dist(p.x,p.y,e2.x,e2.y)<(p.aoeR||50)){
+                  e2.damage(p.damage*0.6,0,0);
+                }
+              }
+              this.particles.magic(p.x,p.y);this.camera.shake(6);
+            }
+            if(!killed&&e.dead){this._onEnemyDied(e);this.particles.blood(e.x,e.y);this.audio.die()}
+            this.particles.spark(p.x,p.y);
+          }
+        }
+      }
+    }
+    this.projectiles=this.projectiles.filter(p=>!p.dead);
+    this.enemies=this.enemies.filter(e=>!e.dead||e._deathTimer>0);
+    // Items
+    for(const item of this.items){
+      item.update(dt);
+      if(!item.collected&&item.inRange(this.player)&&this.input.just('KeyE')){
+        item.collect(this.player,this.particles,this.audio);
+      }
+    }
+    this.items=this.items.filter(i=>!i.collected);
+    // Room visibility & door management
+    const curRoom=this.dg.roomAt(this.player.x,this.player.y);
+    if(curRoom){
+      curRoom.visited=true;
+      const aliveInRoom=this.enemies.filter(e=>!e.dead&&curRoom.contains(Math.floor(e.x/TS),Math.floor(e.y/TS)));
+      if(aliveInRoom.length===0&&!curRoom.cleared){
+        curRoom.cleared=true;
+        this.dg.openDoors(curRoom);
+        if(curRoom!==this.dg.startRoom)this.audio.door();
+        this.player.score+=50;BUS.emit('announce',`Room cleared! +50`);
+      }
+    }
+    // Stairs
+    const tx=Math.floor(this.player.x/TS),ty=Math.floor(this.player.y/TS);
+    if(this.dg.grid[ty]?.[tx]===TILE.STAIRS&&this.input.just('KeyE')){
+      const allAlive=this.enemies.filter(e=>!e.dead);
+      if(allAlive.length===0){
+        this.audio.stairs();this.player.score+=200+this._floor*100;
+        this._beginTransition(this._floor+1,`Descending to Floor ${this._floor+1}...`);
+      } else {BUS.emit('announce','Clear all enemies first!')}
+    }
+    // Camera follows player
+    this.camera.target(this.player.x,this.player.y);
+    this.camera.update(dt);
+    this.particles.update(dt);
+    this.hud.update(dt);
+    // Hint for E key
+    const nearItem=this.items.find(i=>!i.collected&&i.inRange(this.player));
+    const onStairs=this.dg.grid[ty]?.[tx]===TILE.STAIRS;
+    if(nearItem||onStairs){
+      this._eHint=(nearItem?`E — Pick up ${nearItem.label}`:'')||(onStairs?'E — Take stairs':'');
+    } else {this._eHint=''}
+  }
+  _processAttackEffects(effects){
+    for(const eff of effects){
+      if(eff.type==='melee'){
+        for(const e of this.enemies){
+          if(e.dead)continue;
+          const d=dist(eff.x,eff.y,e.x,e.y);
+          if(d<eff.r+e.w/2){
+            const angle=Math.atan2(e.y-eff.y,e.x-eff.x);
+            const wasAlive=!e.dead;
+            e.damage(eff.damage,Math.cos(angle)*120,Math.sin(angle)*120);
+            if(wasAlive&&e.dead){this._onEnemyDied(e);this.audio.die();this.particles.blood(e.x,e.y)}
+            else{this.particles.spark(e.x,e.y);this.camera.shake(3)}
+          }
+        }
+      } else if(eff.type==='projectile'){
+        this.projectiles.push(new Projectile({...eff,isEnemy:false,owner:this.player}));
+      }
+    }
+  }
+  _onEnemyDied(e){
+    this.player.score+=e.xp*this._floor;
+    if(Math.random()<0.3)this.items.push(new GoldCoin(Math.floor(e.x/TS),Math.floor(e.y/TS),randi(5,15)));
+    if(Math.random()<0.1)this.items.push(new HealthPotion(Math.floor(e.x/TS),Math.floor(e.y/TS)));
+    this.camera.shake(5);
+  }
+  _beginTransition(nextFloor,msg){
+    this._state=ST.TRANSITION;
+    this._transTimer=1.8;
+    this._nextFloor=nextFloor;
+    this._transMsg=msg;
+  }
+  _saveScore(){
+    this._hs.push({score:this.player?.score||0,floor:this._floor,date:new Date().toLocaleDateString()});
+    this._hs.sort((a,b)=>b.score-a.score);
+    this._hs=this._hs.slice(0,5);
+    localStorage.setItem('dd_hs',JSON.stringify(this._hs));
+  }
+  // ── Draw ──────────────────────────────────────────────────────────────────
+  _draw(){
+    const ctx=this.ctx;
+    ctx.fillStyle=C.BG;ctx.fillRect(0,0,W,H);
+    switch(this._state){
+      case ST.MENU:
+        const mclick=this._clickedThisFrame;
+        const maction=this.menu.drawTitle(ctx,this.input.mouse.x,this.input.mouse.y,mclick);
+        if(maction==='play'){this.audio.enable();this.player=null;this._loadFloor(1);this._state=ST.PLAY}
+        if(maction==='hs')this._drawHighScores(ctx);
+        break;
+      case ST.PLAY:
+        this._drawWorld(ctx);
+        break;
+      case ST.PAUSE:
+        this._drawWorld(ctx);
+        const pclick=this._clickedThisFrame;
+        const paction=this.menu.drawPause(ctx,this.input.mouse.x,this.input.mouse.y,pclick);
+        if(paction==='resume')this._state=ST.PLAY;
+        if(paction==='quit')this._state=ST.MENU;
+        break;
+      case ST.TRANSITION:
+        this._drawWorld(ctx);
+        const tp=(this._transTimer/1.8);
+        ctx.fillStyle=`rgba(0,0,0,${tp>0.5?(tp-0.5)*2:0})`;ctx.fillRect(0,0,W,H);
+        ctx.globalAlpha=Math.min(1,(1-tp)*3);
+        ctx.fillStyle='#fff';ctx.font='bold 22px monospace';ctx.textAlign='center';
+        ctx.fillText(this._transMsg,W/2,H/2);ctx.globalAlpha=1;
+        break;
+      case ST.GAMEOVER:
+        const gclick=this._clickedThisFrame;
+        const gaction=this.menu.drawGameOver(ctx,this.player,this.input.mouse.x,this.input.mouse.y,gclick);
+        if(gaction==='retry'){this.player=null;this._loadFloor(1);this._state=ST.PLAY}
+        if(gaction==='quit')this._state=ST.MENU;
+        break;
+      case ST.WIN:
+        const wclick=this._clickedThisFrame;
+        const waction=this.menu.drawWin(ctx,this.player,this.input.mouse.x,this.input.mouse.y,wclick);
+        if(waction==='retry'){this.player=null;this._loadFloor(1);this._state=ST.PLAY}
+        if(waction==='quit')this._state=ST.MENU;
+        break;
+    }
+  }
+  _drawWorld(ctx){
+    this.camera.apply(ctx);
+    // Dungeon
+    this.dg.draw(ctx,this.camera.x,this.camera.y);
+    // Particles (below entities)
+    this.particles.draw(ctx);
+    // Items
+    this.items.forEach(i=>i.draw(ctx));
+    // Enemies (sort by Y for depth)
+    [...this.enemies].sort((a,b)=>a.y-b.y).forEach(e=>e.draw(ctx));
+    // Player
+    this.player.draw(ctx);
+    // Projectiles
+    this.projectiles.forEach(p=>p.draw(ctx));
+    // "E" hint
+    if(this._eHint){
+      const tx=Math.floor(this.player.x/TS)*TS+TS/2;
+      const ty=Math.floor(this.player.y/TS)*TS;
+      ctx.fillStyle='rgba(255,255,200,0.85)';ctx.font='bold 11px monospace';ctx.textAlign='center';
+      ctx.fillText(this._eHint,tx,ty-20);
+    }
+    this.camera.restore(ctx);
+    // UI (screen-space, no camera)
+    this.hud.draw(ctx,this.player,this._floor);
+    this.minimap.draw(ctx,this.dg,this.player);
+  }
+  _drawHighScores(ctx){
+    ctx.fillStyle='rgba(0,0,0,0.5)';ctx.fillRect(W/2-100,H/2+50,200,100);
+    ctx.fillStyle=C.UI_TXT;ctx.font='11px monospace';ctx.textAlign='center';
+    ctx.fillText('TOP SCORES',W/2,H/2+68);
+    this._hs.forEach((e,i)=>ctx.fillText(`${i+1}. ${e.score.toString().padStart(6,' ')} (F${e.floor})`,W/2,H/2+86+i*14));
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// § 20  BOOTSTRAP
+// ════════════════════════════════════════════════════════════════════════════
+window.addEventListener('load',()=>{
+  const canvas=document.getElementById('game');
+  const game=new GameManager(canvas);
+  game.start();
+});
+</script>
+</body>
+</html>
