@@ -8,7 +8,7 @@
 
 ## Play Now
 
-**[▶ Open Playable Demo](index.html)** — no install, no plugins
+**[▶ Open Playable Demo](index.html)**
 
 | Key | Action |
 |-----|--------|
